@@ -1,0 +1,100 @@
+name: Создание приложения
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  deployments: write
+  id-token: write
+
+jobs:
+  get_version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v4
+
+      - name: Извлечь версию из app.py
+        id: get_version
+        run: |
+          VERSION=$(grep -E '^VERSION=' app.py | cut -d '"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    needs: get_version
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.create_tag.outputs.tag }}
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v4
+
+      - name: Настроить Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13.8'
+
+      - name: Установить зависимости
+        run: |
+          pip install --upgrade pip
+          pip install cx-Freeze
+          pip install -r requirements.txt
+
+      - name: Собрать установщик MSI
+        run: |
+          python setup.py bdist_msi
+
+      - name: Добавить тег к коммиту с версией
+        id: create_tag
+        shell: pwsh
+        run: |
+          $version = "${{ needs.get_version.outputs.version }}"
+          $TAG = "v$version"
+          git config --local user.email "github-actions@example.com"
+          git config --local user.name "GitHub Actions"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> $env:GITHUB_OUTPUT
+
+      - name: Загрузить артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameSense-installer
+          path: dist/
+
+  release:
+    needs: [build]
+    runs-on: windows-latest
+    steps:
+      - name: Скачать артефакт
+        uses: actions/download-artifact@v4
+        with:
+          name: GameSense-installer
+          path: dist
+
+      - name: Получить версию из тега
+        id: get_tag
+        shell: pwsh
+        run: |
+          $TAG = "${{ needs.build.outputs.tag }}"
+          $VERSION = $TAG -replace 'v', ''
+          echo "version=$VERSION" >> $env:GITHUB_OUTPUT
+
+      - name: Проверить содержимое dist/
+        run: |
+          Get-ChildItem dist/ -Recurse | Format-List Name,Length
+
+      - name: Создать релиз и загрузить артефакт
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.build.outputs.tag }}
+          name: Релиз ${{ steps.get_tag.outputs.version }}
+          draft: false
+          prerelease: false
+          artifacts: dist/GameSense-${{ steps.get_tag.outputs.version }}-win64.msi
+          token: ${{ secrets.GITHUB_TOKEN }}

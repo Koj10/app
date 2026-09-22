@@ -1,0 +1,6 @@
+requests
+pywebview
+pywin32
+ntplib
+packaging
+cx_Freeze

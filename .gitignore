@@ -1,0 +1,9 @@
+token.txt
+__pycache__/
+build/
+dist/
+app.log
+lib/
+config.py
+data/
+GameSense.egg-info/
