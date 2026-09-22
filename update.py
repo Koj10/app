@@ -6,6 +6,11 @@ import sys
 import requests
 from packaging import version
 
+try:
+    from config import GITHUB_REPO
+except ImportError:
+    GITHUB_REPO = "Koji10/app"
+
 APPDATA_DIR = os.getenv("LOCALAPPDATA")
 DIR = os.path.join(APPDATA_DIR, "GameSense")
 LOG_FILE = os.path.join(DIR, "update.log")
@@ -22,7 +27,7 @@ if not update_logger.handlers:
 
 def get_latest_tag():
     try:
-        api_url = "https://api.github.com/repos/GameSense-club/app/tags"
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/tags"
         response = requests.get(api_url, timeout=5)
         response.raise_for_status()
 
@@ -61,7 +66,7 @@ def check_for_updates(current_version):
 def download_and_install_update(latest_version):
     try:
         msi_url = (
-            f"https://github.com/GameSense-club/app/releases/download/"
+            f"https://github.com/{GITHUB_REPO}/releases/download/"
             f"v{latest_version}/GameSense-{latest_version}-win64.msi"
         )
         temp_dir = os.path.join(os.environ["TEMP"], "GameSenseUpdate")

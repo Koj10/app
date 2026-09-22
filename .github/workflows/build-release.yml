@@ -22,7 +22,9 @@ jobs:
       - name: Извлечь версию из app.py
         id: get_version
         run: |
-          VERSION=$(grep -E '^VERSION=' app.py | cut -d '"' -f2)
+          VERSION=$(grep -E '^VERSION\s*=' app.py | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VERSION" ]; then echo "VERSION not found in app.py"; exit 1; fi
+          echo "Detected version: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
   build:
