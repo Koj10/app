@@ -1,4 +1,4 @@
-VERSION = "1.1.11"
+VERSION = "1.1.12"
 
 import atexit
 import os
@@ -523,6 +523,8 @@ def _enter_admin():
     block_keyboard.set_foreground_lock(False)
     block_keyboard.set_mode(block_keyboard.MODE_OFF, hide_taskbar=False)
     policy_guard.set_mode(policy_guard.MODE_OFF)
+    block_keyboard.set_win_key_block(False)
+    policy_guard.release_start_menu()
     _show_admin_window()
     _start_explorer()
 

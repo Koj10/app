@@ -574,10 +574,17 @@ def _release_start_menu():
 
     pids = _start_host_pids()
     with _suspend_lock:
+        had_block = bool(_suspended_start)
         for pid in set(_suspended_start) | set(pids):
             _resume_pid(pid)
         _suspended_start.clear()
         _start_held_logged = False
+    if had_block:
+        logger.info("PolicyGuard: меню Пуск снова доступно")
+
+
+def release_start_menu():
+    _release_start_menu()
 
 
 def _on_win_key():
