@@ -51,6 +51,9 @@ def _delete_value(root, path, name):
 
 def enable():
     global _active
+    if _active:
+        return True
+
     applied = 0
 
     for root, path, label in _POLICY_APPS:

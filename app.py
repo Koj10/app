@@ -1,4 +1,4 @@
-VERSION = "1.1.3"
+VERSION = "1.1.5"
 
 import atexit
 import os
@@ -17,6 +17,7 @@ import win32gui
 import add_autostart
 import block_keyboard
 import policy_guard
+import ui_invoke
 import window_guard
 from logging_config import logger
 from token_utils import create_token
@@ -65,7 +66,6 @@ http.headers.update({"Content-Type": "application/json", "Authorization": f"Bear
 
 window = None
 _mode = None  # waiting | session | admin
-_ui_lock = threading.Lock()
 _stop_polling = threading.Event()
 _screen_size = None
 _hwnd = None
@@ -94,29 +94,23 @@ class ShellApi:
 
 
 def minimize_to_desktop():
-    with _ui_lock:
-        if not window:
-            return
-        try:
-            hwnd = _find_hwnd()
-            if hwnd:
-                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-                logger.info("GameSense свёрнут на рабочий стол")
-        except Exception as e:
-            logger.error("minimize_to_desktop: %s", e)
+    if not window:
+        return
+    try:
+        window.minimize()
+        logger.info("GameSense свёрнут на рабочий стол")
+    except Exception as e:
+        logger.error("minimize_to_desktop: %s", e)
 
 
 def restore_app_window():
-    with _ui_lock:
-        if not window:
-            return
-        try:
-            hwnd = _find_hwnd()
-            if hwnd:
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(hwnd)
-        except Exception as e:
-            logger.error("restore_app_window: %s", e)
+    if not window:
+        return
+    try:
+        window.restore()
+        window.show()
+    except Exception as e:
+        logger.error("restore_app_window: %s", e)
 
 
 def _sync_ntp(force=False):
@@ -222,53 +216,62 @@ def _show_in_taskbar(hwnd):
     _native_show(hwnd)
 
 
-def _show_waiting_window():
-    with _ui_lock:
-        if not window:
+def _show_waiting_window_impl():
+    if not window:
+        return
+    try:
+        size = _get_screen_size()
+        if not size:
             return
-        try:
-            size = _get_screen_size()
-            if not size:
-                return
-            screen_width, screen_height = size
-            hwnd = _find_hwnd()
-            _show_in_taskbar(hwnd)
-            _native_move_resize(hwnd, screen_width, screen_height, topmost=True)
-            window_guard.protect(hwnd, block_close=True)
-        except Exception as e:
-            logger.error("_show_waiting_window: %s", e)
+        screen_width, screen_height = size
+        hwnd = _find_hwnd()
+        _show_in_taskbar(hwnd)
+        _native_move_resize(hwnd, screen_width, screen_height, topmost=True)
+        window_guard.protect(hwnd, block_close=True)
+    except Exception as e:
+        logger.error("_show_waiting_window: %s", e)
+
+
+def _show_session_window_impl():
+    if not window:
+        return
+    try:
+        size = _get_screen_size()
+        if not size:
+            return
+        screen_width, screen_height = size
+        hwnd = _find_hwnd()
+        _show_in_taskbar(hwnd)
+        _native_move_resize(hwnd, screen_width, screen_height, topmost=False)
+        window_guard.protect(hwnd, block_close=True)
+        _native_show(hwnd)
+    except Exception as e:
+        logger.error("_show_session_window: %s", e)
+
+
+def _show_admin_window_impl():
+    if not window:
+        return
+    try:
+        hwnd = _find_hwnd()
+        window_guard.release(hwnd)
+        window_guard.set_topmost(hwnd, False)
+        _show_in_taskbar(hwnd)
+        _native_show(hwnd)
+    except Exception as e:
+        logger.error("_show_admin_window: %s", e)
+
+
+def _show_waiting_window():
+    ui_invoke.run(_show_waiting_window_impl)
 
 
 def _show_session_window():
-    with _ui_lock:
-        if not window:
-            return
-        try:
-            size = _get_screen_size()
-            if not size:
-                return
-            screen_width, screen_height = size
-            hwnd = _find_hwnd()
-            _show_in_taskbar(hwnd)
-            _native_move_resize(hwnd, screen_width, screen_height, topmost=False)
-            window_guard.protect(hwnd, block_close=True)
-            _native_show(hwnd)
-        except Exception as e:
-            logger.error("_show_session_window: %s", e)
+    ui_invoke.run(_show_session_window_impl)
 
 
 def _show_admin_window():
-    with _ui_lock:
-        if not window:
-            return
-        try:
-            hwnd = _find_hwnd()
-            window_guard.release(hwnd)
-            window_guard.set_topmost(hwnd, False)
-            _show_in_taskbar(hwnd)
-            _native_show(hwnd)
-        except Exception as e:
-            logger.error("_show_admin_window: %s", e)
+    ui_invoke.run(_show_admin_window_impl)
 
 
 def _maybe_launch_repair_tool():
@@ -326,12 +329,15 @@ def _enter_session():
     policy_guard.set_mode(policy_guard.MODE_SESSION)
 
     if first_entry and window:
-        try:
-            window.evaluate_js(
-                "window.dispatchEvent(new CustomEvent('gs-session-started'));"
-            )
-        except Exception as e:
-            logger.debug("session js event: %s", e)
+        def _fire_session_event():
+            try:
+                window.evaluate_js(
+                    "window.dispatchEvent(new CustomEvent('gs-session-started'));"
+                )
+            except Exception as e:
+                logger.debug("session js event: %s", e)
+
+        ui_invoke.run(_fire_session_event)
 
 
 def _enter_admin():
@@ -438,9 +444,9 @@ def start_app():
             background_color="#110e1a",
             js_api=ShellApi(),
         )
+        ui_invoke.configure(lambda: window)
         window.events.loaded += _on_window_loaded
         window.events.closing += _on_closing
-        block_keyboard.start_hotkey(restore_app_window)
         threading.Thread(target=_check_updates_background, daemon=True, name="updates").start()
         webview.start(api_loop, window, debug=DEBUG)
     except Exception as e:
@@ -452,7 +458,6 @@ def exit_handler():
     logger.info("Приложение завершает работу")
     _stop_polling.set()
     block_keyboard.stop_block()
-    block_keyboard.stop_hotkey()
     policy_guard.stop()
     window_guard.release(_find_hwnd())
     http.close()

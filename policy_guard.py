@@ -10,10 +10,17 @@ MODE_OFF = "off"
 MODE_WAITING = "waiting"
 MODE_SESSION = "session"
 
+_INTERVALS = {
+    MODE_WAITING: 4.0,
+    MODE_SESSION: 8.0,
+}
+
 _lock = threading.Lock()
 _thread = None
 _stop = threading.Event()
 _mode = MODE_OFF
+_download_policy_mode = None
+_purge_counter = 0
 
 _ALWAYS_ALLOW = frozenset(
     {
@@ -144,20 +151,15 @@ def _is_installer(name):
     return False
 
 
-def _targets_for_mode(mode):
+def _targets_for_mode(mode, running):
     targets = set()
     if mode == MODE_WAITING:
-        targets |= _SHELL_TOOLS
+        targets |= _SHELL_TOOLS | _INSTALLERS
     elif mode == MODE_SESSION:
-        # В сессии explorer нужен для Alt+Tab и переключения окон
-        session_block = _SHELL_TOOLS - {"explorer.exe"}
-        targets |= session_block
-    if mode == MODE_SESSION:
-        for name in _list_process_names():
+        targets |= _SHELL_TOOLS - {"explorer.exe"}
+        for name in running:
             if _is_installer(name):
                 targets.add(name)
-    elif mode == MODE_WAITING:
-        targets |= _INSTALLERS
     return targets
 
 
@@ -166,7 +168,7 @@ def _enforce_processes(mode):
         return
 
     running = _list_process_names()
-    targets = _targets_for_mode(mode)
+    targets = _targets_for_mode(mode, running)
 
     for name in targets:
         if name in _ALWAYS_ALLOW or name in _LAUNCHER_ALLOW:
@@ -200,27 +202,42 @@ def _purge_downloads(mode):
 
 
 def _apply_download_policies(mode):
-    if mode in (MODE_WAITING, MODE_SESSION):
+    global _download_policy_mode
+
+    want = mode if mode in (MODE_WAITING, MODE_SESSION) else MODE_OFF
+    if want == _download_policy_mode:
+        return
+
+    if want != MODE_OFF:
         browser_download_block.enable()
     else:
         browser_download_block.disable()
+    _download_policy_mode = want
 
 
 def _loop():
+    global _purge_counter
+
     while not _stop.is_set():
         with _lock:
             mode = _mode
+        interval = _INTERVALS.get(mode, 4.0)
+
         if mode != MODE_OFF:
             try:
                 _enforce_processes(mode)
-                _purge_downloads(mode)
+                _purge_counter += 1
+                if _purge_counter >= 3:
+                    _purge_downloads(mode)
+                    _purge_counter = 0
             except Exception as e:
                 logger.error("PolicyGuard: %s", e)
-        _stop.wait(1.5)
+
+        _stop.wait(interval)
 
 
 def set_mode(mode):
-    global _mode, _thread
+    global _mode, _thread, _purge_counter
     if mode not in (MODE_OFF, MODE_WAITING, MODE_SESSION):
         mode = MODE_OFF
 
@@ -232,6 +249,7 @@ def set_mode(mode):
         return
 
     _apply_download_policies(mode)
+    _purge_counter = 0
 
     with _lock:
         if _thread and _thread.is_alive():
@@ -244,7 +262,7 @@ def set_mode(mode):
 
 
 def stop():
-    global _thread, _mode
+    global _thread, _mode, _download_policy_mode, _purge_counter
     _stop.set()
     browser_download_block.disable()
     with _lock:
@@ -252,4 +270,6 @@ def stop():
             _thread.join(timeout=2.0)
         _thread = None
         _mode = MODE_OFF
+        _download_policy_mode = None
+        _purge_counter = 0
     _stop.clear()
