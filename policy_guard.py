@@ -1,7 +1,10 @@
 import os
 import subprocess
 import threading
-import time
+import winreg
+
+import win32con
+import win32gui
 
 import browser_download_block
 from logging_config import logger
@@ -18,9 +21,22 @@ _INTERVALS = {
 _lock = threading.Lock()
 _thread = None
 _stop = threading.Event()
+_wake = threading.Event()
 _mode = MODE_OFF
 _download_policy_mode = None
+_shell_locked = False
 _purge_counter = 0
+
+# Окна файлового проводника и диспетчера задач. Рабочий стол (Progman) не трогаем.
+_BLOCKED_WINDOW_CLASSES = frozenset(
+    {
+        "CabinetWClass",
+        "ExploreWClass",
+        "TaskManagerWindow",
+    }
+)
+
+_TASKMGR_POLICY = r"Software\Microsoft\Windows\CurrentVersion\Policies\System"
 
 _ALWAYS_ALLOW = frozenset(
     {
@@ -179,6 +195,90 @@ def _enforce_processes(mode):
             _kill_process(name)
 
 
+def _set_dword(root, path, name, value):
+    try:
+        key = winreg.CreateKeyEx(root, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY)
+        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+        winreg.CloseKey(key)
+        return True
+    except OSError as e:
+        logger.debug("policy %s: %s", name, e)
+        return False
+
+
+def _delete_value(root, path, name):
+    try:
+        key = winreg.OpenKeyEx(root, path, 0, winreg.KEY_SET_VALUE)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        logger.debug("policy open %s: %s", name, e)
+        return False
+    try:
+        winreg.DeleteValue(key, name)
+    except FileNotFoundError:
+        pass
+    finally:
+        winreg.CloseKey(key)
+    return True
+
+
+def _broadcast_policy():
+    try:
+        win32gui.SendMessageTimeout(
+            win32con.HWND_BROADCAST,
+            win32con.WM_SETTINGCHANGE,
+            0,
+            "Policy",
+            win32con.SMTO_ABORTIFHUNG,
+            500,
+        )
+    except Exception as e:
+        logger.debug("policy broadcast: %s", e)
+
+
+def _apply_shell_policies(lock_down):
+    """DisableTaskMgr: диспетчер задач не запускается, в том числе с Ctrl+Alt+Del."""
+    global _shell_locked
+    if lock_down == _shell_locked:
+        return
+
+    if lock_down:
+        _set_dword(winreg.HKEY_CURRENT_USER, _TASKMGR_POLICY, "DisableTaskMgr", 1)
+        logger.info("PolicyGuard: диспетчер задач отключён")
+    else:
+        _delete_value(winreg.HKEY_CURRENT_USER, _TASKMGR_POLICY, "DisableTaskMgr")
+        logger.info("PolicyGuard: диспетчер задач снова доступен")
+
+    _broadcast_policy()
+    _shell_locked = lock_down
+
+
+def _close_blocked_windows():
+    """Закрыть окна проводника. Процесс explorer.exe остаётся — это рабочий стол и панель задач."""
+
+    def _enum(hwnd, _):
+        try:
+            class_name = win32gui.GetClassName(hwnd)
+        except Exception:
+            return True
+        if class_name not in _BLOCKED_WINDOW_CLASSES:
+            return True
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception as e:
+            logger.debug("close window %s: %s", class_name, e)
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum, None)
+    except Exception as e:
+        logger.debug("EnumWindows: %s", e)
+
+
 def _purge_downloads(mode):
     if mode not in (MODE_WAITING, MODE_SESSION):
         return
@@ -220,12 +320,28 @@ def _apply_download_policies(mode):
 def _loop():
     global _purge_counter
 
+    scan_ticks = 0
     while not _stop.is_set():
         with _lock:
             mode = _mode
-        interval = _INTERVALS.get(mode, 4.0)
 
-        if mode != MODE_OFF:
+        if mode == MODE_SESSION:
+            try:
+                _close_blocked_windows()
+            except Exception as e:
+                logger.debug("close windows: %s", e)
+            interval = 0.15
+            scan_ticks += 1
+            do_scan = scan_ticks >= 27
+        elif mode == MODE_WAITING:
+            interval = _INTERVALS[MODE_WAITING]
+            do_scan = True
+        else:
+            interval = 1.0
+            do_scan = False
+
+        if do_scan and mode != MODE_OFF:
+            scan_ticks = 0
             try:
                 _enforce_processes(mode)
                 _purge_counter += 1
@@ -235,7 +351,8 @@ def _loop():
             except Exception as e:
                 logger.error("PolicyGuard: %s", e)
 
-        _stop.wait(interval)
+        _wake.wait(interval)
+        _wake.clear()
 
 
 def set_mode(mode):
@@ -251,7 +368,9 @@ def set_mode(mode):
         return
 
     _apply_download_policies(mode)
+    _apply_shell_policies(True)
     _purge_counter = 0
+    _wake.set()
 
     with _lock:
         if _thread and _thread.is_alive():
@@ -266,6 +385,8 @@ def set_mode(mode):
 def stop():
     global _thread, _mode, _download_policy_mode, _purge_counter
     _stop.set()
+    _wake.set()
+    _apply_shell_policies(False)
     browser_download_block.disable()
     with _lock:
         if _thread and _thread.is_alive():
@@ -275,3 +396,4 @@ def stop():
         _download_policy_mode = None
         _purge_counter = 0
     _stop.clear()
+    _wake.clear()

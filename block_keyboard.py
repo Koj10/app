@@ -14,6 +14,8 @@ WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+LLKHF_ALTDOWN = 0x20
+THREAD_PRIORITY_HIGHEST = 2
 
 MOD_ALT = 0x0001
 VK_X = 0x58
@@ -69,33 +71,37 @@ def _unhook():
         _hook_id = None
 
 
-def _should_block(vk, is_keydown):
-    global _alt_down, _ctrl_down, _shift_down
-
-    if not is_keydown:
-        return False
-
+def _should_block(vk, is_keydown, alt_held):
     mode = _keyboard_mode
     if mode == MODE_OFF:
         return False
 
+    # Меню Пуск открывается на отпускании Win, поэтому гасим и нажатие, и отпускание.
     if vk in (win32con.VK_LWIN, win32con.VK_RWIN):
         return True
 
     if mode == MODE_STRICT:
-        if _alt_down and vk in (win32con.VK_TAB, win32con.VK_F4, win32con.VK_ESCAPE):
+        if alt_held and vk in (
+            win32con.VK_TAB,
+            win32con.VK_ESCAPE,
+            win32con.VK_F4,
+            win32con.VK_SPACE,
+        ):
             return True
         if _ctrl_down and vk == win32con.VK_ESCAPE:
             return True
-        if _ctrl_down and _shift_down and vk == win32con.VK_ESCAPE:
+        if not is_keydown:
+            return False
+        if vk == win32con.VK_APPS:
             return True
         return False
 
     if mode == MODE_SESSION:
-        if _ctrl_down and _shift_down and vk == win32con.VK_ESCAPE:
-            return True
+        # Ctrl+Shift+Esc открывает диспетчер задач и на отпускании.
         if _ctrl_down and vk == win32con.VK_ESCAPE:
             return True
+        if not is_keydown:
+            return False
         return False
 
     return False
@@ -116,7 +122,9 @@ def listen():
     global _running, _hook_id, _listener_thread_id
 
     user32 = ctypes.windll.user32
-    _listener_thread_id = win32api.GetCurrentThreadId()
+    kernel32 = ctypes.windll.kernel32
+    _listener_thread_id = kernel32.GetCurrentThreadId()
+    kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
 
     def low_level_handler(nCode, wParam, lParam):
         if nCode < 0 or not _running:
@@ -129,9 +137,17 @@ def listen():
 
         kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         vk = kb.vkCode
+        alt_held = bool(kb.flags & LLKHF_ALTDOWN) or _alt_down
+        if (
+            not alt_held
+            and _keyboard_mode == MODE_STRICT
+            and vk in (win32con.VK_TAB, win32con.VK_ESCAPE, win32con.VK_F4)
+        ):
+            alt_held = bool(user32.GetAsyncKeyState(win32con.VK_MENU) & 0x8000)
+
         _update_modifiers(vk, is_keydown)
 
-        if is_keydown and _should_block(vk, True):
+        if _should_block(vk, is_keydown, alt_held):
             return 1
 
         return user32.CallNextHookEx(_hook_id, nCode, wParam, lParam)
