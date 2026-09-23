@@ -1,4 +1,4 @@
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 
 import atexit
 import os
@@ -71,6 +71,10 @@ _screen_size = None
 _hwnd = None
 _app_ready = threading.Event()
 _last_status = None
+_shell_minimized = False
+_minimize_in_progress = False
+_minimize_token = 0
+_suspend_action = None
 
 _ntp_offset = timedelta(0)
 _ntp_synced_at = 0.0
@@ -93,24 +97,170 @@ class ShellApi:
         return True
 
 
-def minimize_to_desktop():
+def _browser_view():
     if not window:
+        return None
+    try:
+        from webview.platforms import winforms
+
+        return winforms.BrowserView.instances.get(window.uid)
+    except Exception as e:
+        logger.debug("browser view: %s", e)
+        return None
+
+
+def _webview_control():
+    view = _browser_view()
+    if not view:
+        return None
+    return getattr(view, "webview", None)
+
+
+def _core_webview():
+    ctrl = _webview_control()
+    if ctrl is None:
+        return None
+    try:
+        return ctrl.CoreWebView2
+    except Exception:
+        return None
+
+
+def _set_webview_visible(visible):
+    ctrl = _webview_control()
+    if ctrl is None:
         return
     try:
-        window.minimize()
+        ctrl.Visible = bool(visible)
+    except Exception as e:
+        logger.debug("webview.Visible: %s", e)
+
+
+def _resume_webview():
+    core = _core_webview()
+    if core is None:
+        return
+    try:
+        core.Resume()
+    except Exception as e:
+        logger.debug("webview Resume: %s", e)
+
+
+def _finish_minimize():
+    """Свернуть окно без WinForms.WindowState — он вешает fullscreen WebView2."""
+    global _shell_minimized, _minimize_in_progress
+    if _shell_minimized or _minimize_in_progress:
+        return
+    _minimize_in_progress = True
+    try:
+        _set_webview_visible(False)
+        hwnd = _find_hwnd()
+        if hwnd:
+            window_guard.set_topmost(hwnd, False)
+            _shell_minimized = True
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        else:
+            _shell_minimized = True
         logger.info("GameSense свёрнут на рабочий стол")
     except Exception as e:
+        _shell_minimized = False
         logger.error("minimize_to_desktop: %s", e)
+    finally:
+        _minimize_in_progress = False
+
+
+def _minimize_on_ui():
+    global _suspend_action, _minimize_token
+    _minimize_token += 1
+    token = _minimize_token
+    core = _core_webview()
+
+    def _fallback():
+        time.sleep(2)
+
+        def _run():
+            if token != _minimize_token or _shell_minimized:
+                return
+            _finish_minimize()
+
+        ui_invoke.post(_run)
+
+    if core is None:
+        _finish_minimize()
+        threading.Thread(target=_fallback, daemon=True, name="minimize-fallback").start()
+        return
+
+    try:
+        from System import Action
+
+        task = core.TrySuspendAsync()
+        awaiter = task.GetAwaiter()
+
+        def _after_suspend():
+            def _run():
+                if token != _minimize_token:
+                    return
+                _finish_minimize()
+
+            ui_invoke.post(_run)
+
+        _suspend_action = Action(_after_suspend)
+        awaiter.OnCompleted(_suspend_action)
+    except Exception as e:
+        logger.debug("TrySuspendAsync: %s", e)
+        _finish_minimize()
+
+    threading.Thread(target=_fallback, daemon=True, name="minimize-fallback").start()
+
+
+def _minimize_after_bridge():
+    # pywebview после возврата из js_api сам вызывает evaluate_js.
+    # Сворачиваем окно только когда этот вызов уже ушёл с UI-потока.
+    time.sleep(0.35)
+    ui_invoke.post(_minimize_on_ui)
+
+
+def minimize_to_desktop():
+    if not window or _shell_minimized:
+        return
+    threading.Thread(target=_minimize_after_bridge, daemon=True, name="minimize-desktop").start()
+
+
+def _resume_shell_ui(force=False):
+    global _shell_minimized, _minimize_token
+    if _minimize_in_progress or not _shell_minimized:
+        return
+    _minimize_token += 1
+    hwnd = _find_hwnd()
+    iconic = bool(hwnd and win32gui.IsIconic(hwnd))
+    # Пока окно ещё свёрнуто, restored часто приходит от самого SW_MINIMIZE.
+    if iconic and not force:
+        return
+    _shell_minimized = False
+    try:
+        if iconic and hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        _resume_webview()
+        _set_webview_visible(True)
+        if _mode == "waiting":
+            _show_waiting_window_impl()
+        elif _mode == "admin":
+            _show_admin_window_impl()
+        else:
+            _show_session_window_impl()
+        logger.info("GameSense восстановлен")
+    except Exception as e:
+        logger.error("restore_app_window: %s", e)
+
+
+def _on_shell_restored(*_args):
+    ui_invoke.post(lambda: _resume_shell_ui(False))
 
 
 def restore_app_window():
     if not window:
         return
-    try:
-        window.restore()
-        window.show()
-    except Exception as e:
-        logger.error("restore_app_window: %s", e)
+    ui_invoke.post(lambda: _resume_shell_ui(True))
 
 
 def _sync_ntp(force=False):
@@ -216,10 +366,23 @@ def _show_in_taskbar(hwnd):
     _native_show(hwnd)
 
 
+def _prepare_visible_shell():
+    """Вернуть оболочку на экран, если её свернули на рабочий стол."""
+    global _shell_minimized, _minimize_token
+    _minimize_token += 1
+    _shell_minimized = False
+    hwnd = _find_hwnd()
+    if hwnd and win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    _resume_webview()
+    _set_webview_visible(True)
+
+
 def _show_waiting_window_impl():
     if not window:
         return
     try:
+        _prepare_visible_shell()
         size = _get_screen_size()
         if not size:
             return
@@ -253,6 +416,7 @@ def _show_admin_window_impl():
     if not window:
         return
     try:
+        _prepare_visible_shell()
         hwnd = _find_hwnd()
         window_guard.release(hwnd)
         window_guard.set_topmost(hwnd, False)
@@ -323,21 +487,26 @@ def _enter_session():
         return
 
     logger.info("Режим: игровая сессия")
+    # Сначала снимаем запрет explorer, иначе PolicyGuard успевает убить только что запущенный рабочий стол.
+    policy_guard.set_mode(policy_guard.MODE_SESSION)
+    block_keyboard.set_mode(block_keyboard.MODE_SESSION, hide_taskbar=False)
     _start_explorer()
     _show_session_window()
-    block_keyboard.set_mode(block_keyboard.MODE_SESSION, hide_taskbar=False)
-    policy_guard.set_mode(policy_guard.MODE_SESSION)
 
     if first_entry and window:
-        def _fire_session_event():
-            try:
-                window.evaluate_js(
-                    "window.dispatchEvent(new CustomEvent('gs-session-started'));"
-                )
-            except Exception as e:
-                logger.debug("session js event: %s", e)
+        threading.Thread(
+            target=_notify_session_started, daemon=True, name="session-event"
+        ).start()
 
-        ui_invoke.run(_fire_session_event)
+
+def _notify_session_started():
+    """Событие для страницы. Только из фонового потока: evaluate_js с UI-потока вешает окно."""
+    if not window:
+        return
+    try:
+        window.evaluate_js("window.dispatchEvent(new CustomEvent('gs-session-started'));")
+    except Exception as e:
+        logger.debug("session js event: %s", e)
 
 
 def _enter_admin():
@@ -447,6 +616,7 @@ def start_app():
         ui_invoke.configure(lambda: window)
         window.events.loaded += _on_window_loaded
         window.events.closing += _on_closing
+        window.events.restored += _on_shell_restored
         threading.Thread(target=_check_updates_background, daemon=True, name="updates").start()
         webview.start(api_loop, window, debug=DEBUG)
     except Exception as e:

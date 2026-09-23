@@ -164,10 +164,12 @@ def _targets_for_mode(mode, running):
 
 
 def _enforce_processes(mode):
+    running = _list_process_names()
+    with _lock:
+        mode = _mode
     if mode == MODE_OFF:
         return
 
-    running = _list_process_names()
     targets = _targets_for_mode(mode, running)
 
     for name in targets:
