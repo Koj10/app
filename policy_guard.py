@@ -1,7 +1,9 @@
+import ctypes
 import os
 import subprocess
 import threading
 import winreg
+from ctypes import wintypes
 
 import win32con
 import win32gui
@@ -24,15 +26,28 @@ _stop = threading.Event()
 _wake = threading.Event()
 _mode = MODE_OFF
 _download_policy_mode = None
-_shell_locked = False
+_shell_policy_mode = None
 _purge_counter = 0
+_taskmgr_kill = None
+
+# Все буквы дисков A–Z.
+_ALL_DRIVES = 0x03FFFFFF
+
+_EXPLORER_POLICY = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
 
 # Окна файлового проводника и диспетчера задач. Рабочий стол (Progman) не трогаем.
-_BLOCKED_WINDOW_CLASSES = frozenset(
+_FILE_WINDOW_CLASSES = frozenset(
     {
         "CabinetWClass",
         "ExploreWClass",
-        "TaskManagerWindow",
+    }
+)
+_TASKMGR_WINDOW_CLASSES = frozenset({"TaskManagerWindow"})
+# Переключатель задач. Только в ожидании: в сессии Alt+Tab нужен для игр.
+_SWITCHER_WINDOW_CLASSES = frozenset(
+    {
+        "MultitaskingViewFrame",
+        "XamlExplorerHostIslandWindow",
     }
 )
 
@@ -115,13 +130,24 @@ def _init_watch_dirs():
     if _WATCH_DIRS:
         return
     home = os.path.expanduser("~")
-    _WATCH_DIRS = [
+    folders = [
         os.path.join(home, "Downloads"),
         os.path.join(home, "Desktop"),
         os.path.join(home, "Documents"),
         os.path.join(os.environ.get("TEMP", home), ""),
         os.path.join(home, "AppData", "Local", "Temp"),
     ]
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ) as key:
+            downloads, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
+            if downloads:
+                folders.append(downloads)
+    except OSError:
+        pass
+    _WATCH_DIRS = folders
 
 
 def _list_process_names():
@@ -195,6 +221,22 @@ def _enforce_processes(mode):
             _kill_process(name)
 
 
+def _kill_taskmgr():
+    """Диспетчер задач гасится сразу, не раз в несколько секунд."""
+    global _taskmgr_kill
+    if _taskmgr_kill is not None and _taskmgr_kill.poll() is None:
+        return
+    try:
+        _taskmgr_kill = subprocess.Popen(
+            ["taskkill", "/F", "/IM", "taskmgr.exe"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        logger.debug("taskkill taskmgr: %s", e)
+
+
 def _set_dword(root, path, name, value):
     try:
         key = winreg.CreateKeyEx(root, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY)
@@ -237,46 +279,101 @@ def _broadcast_policy():
         logger.debug("policy broadcast: %s", e)
 
 
-def _apply_shell_policies(lock_down):
-    """DisableTaskMgr: диспетчер задач не запускается, в том числе с Ctrl+Alt+Del."""
-    global _shell_locked
-    if lock_down == _shell_locked:
+def _apply_shell_policies(mode):
+    """Win, диспетчер задач и диски. Диски только в сессии: в ожидании проводника нет."""
+    global _shell_policy_mode
+    if mode == _shell_policy_mode:
         return
 
-    if lock_down:
-        _set_dword(winreg.HKEY_CURRENT_USER, _TASKMGR_POLICY, "DisableTaskMgr", 1)
-        logger.info("PolicyGuard: диспетчер задач отключён")
+    lock = mode in (MODE_WAITING, MODE_SESSION)
+    if lock:
+        if not _set_dword(winreg.HKEY_CURRENT_USER, _TASKMGR_POLICY, "DisableTaskMgr", 1):
+            logger.warning("Не удалось отключить диспетчер задач через реестр")
+        _set_dword(winreg.HKEY_LOCAL_MACHINE, _TASKMGR_POLICY, "DisableTaskMgr", 1)
+        if not _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoWinKeys", 1):
+            logger.warning("Не удалось отключить клавишу Win через реестр")
     else:
         _delete_value(winreg.HKEY_CURRENT_USER, _TASKMGR_POLICY, "DisableTaskMgr")
-        logger.info("PolicyGuard: диспетчер задач снова доступен")
+        _delete_value(winreg.HKEY_LOCAL_MACHINE, _TASKMGR_POLICY, "DisableTaskMgr")
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoWinKeys")
+
+    if mode == MODE_SESSION:
+        drives_hidden = _set_dword(
+            winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoDrives", _ALL_DRIVES
+        ) and _set_dword(
+            winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewOnDrive", _ALL_DRIVES
+        )
+        if not drives_hidden:
+            logger.warning("Не удалось закрыть диски в проводнике через реестр")
+        logger.info("PolicyGuard: диски в проводнике закрыты, диспетчер задач отключён")
+    else:
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoDrives")
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewOnDrive")
+        if lock:
+            logger.info("PolicyGuard: Win и диспетчер задач отключены")
+        elif _shell_policy_mode is not None:
+            logger.info("PolicyGuard: ограничения оболочки сняты")
 
     _broadcast_policy()
-    _shell_locked = lock_down
+    _shell_policy_mode = mode
 
 
-def _close_blocked_windows():
-    """Закрыть окна проводника. Процесс explorer.exe остаётся — это рабочий стол и панель задач."""
+def _close_window_classes(classes):
+    """Только PostMessage: ShowWindow из этого потока может зависнуть и остановить всю защиту."""
 
     def _enum(hwnd, _):
         try:
             class_name = win32gui.GetClassName(hwnd)
         except Exception:
             return True
-        if class_name not in _BLOCKED_WINDOW_CLASSES:
-            return True
-        if not win32gui.IsWindowVisible(hwnd):
+        if class_name not in classes or not win32gui.IsWindowVisible(hwnd):
             return True
         try:
-            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         except Exception as e:
-            logger.debug("close window %s: %s", class_name, e)
+            logger.debug("close %s: %s", class_name, e)
         return True
 
     try:
         win32gui.EnumWindows(_enum, None)
     except Exception as e:
         logger.debug("EnumWindows: %s", e)
+
+
+def _refocus_shell():
+    user32 = ctypes.windll.user32
+    shell = win32gui.FindWindow(None, "GameSense")
+    if not shell:
+        return
+    foreground = win32gui.GetForegroundWindow()
+    if not foreground or foreground == shell:
+        return
+
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(foreground, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return
+
+    try:
+        fg_thread = user32.GetWindowThreadProcessId(foreground, None)
+        shell_thread = user32.GetWindowThreadProcessId(shell, None)
+        current = ctypes.windll.kernel32.GetCurrentThreadId()
+        user32.AttachThreadInput(current, fg_thread, True)
+        user32.AttachThreadInput(current, shell_thread, True)
+        win32gui.SetForegroundWindow(shell)
+        win32gui.SetWindowPos(
+            shell,
+            win32con.HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+        )
+        user32.AttachThreadInput(current, fg_thread, False)
+        user32.AttachThreadInput(current, shell_thread, False)
+    except Exception as e:
+        logger.debug("refocus: %s", e)
 
 
 def _purge_downloads(mode):
@@ -320,37 +417,39 @@ def _apply_download_policies(mode):
 def _loop():
     global _purge_counter
 
-    scan_ticks = 0
+    ticks = 0
     while not _stop.is_set():
         with _lock:
             mode = _mode
 
-        if mode == MODE_SESSION:
-            try:
-                _close_blocked_windows()
-            except Exception as e:
-                logger.debug("close windows: %s", e)
-            interval = 0.15
-            scan_ticks += 1
-            do_scan = scan_ticks >= 27
-        elif mode == MODE_WAITING:
-            interval = _INTERVALS[MODE_WAITING]
-            do_scan = True
-        else:
-            interval = 1.0
-            do_scan = False
+        if mode == MODE_WAITING:
+            _close_window_classes(
+                _FILE_WINDOW_CLASSES | _TASKMGR_WINDOW_CLASSES | _SWITCHER_WINDOW_CLASSES
+            )
+            _refocus_shell()
+        elif mode == MODE_SESSION:
+            _close_window_classes(_FILE_WINDOW_CLASSES | _TASKMGR_WINDOW_CLASSES)
 
-        if do_scan and mode != MODE_OFF:
-            scan_ticks = 0
+        if mode in (MODE_WAITING, MODE_SESSION) and ticks % 3 == 0:
+            _kill_taskmgr()
+
+        do_scan = mode == MODE_WAITING and ticks % 5 == 0
+        do_scan = do_scan or (mode == MODE_SESSION and ticks % 10 == 0)
+        do_purge = mode in (MODE_WAITING, MODE_SESSION) and ticks % 5 == 0
+
+        if do_scan:
             try:
                 _enforce_processes(mode)
-                _purge_counter += 1
-                if _purge_counter >= 3:
-                    _purge_downloads(mode)
-                    _purge_counter = 0
             except Exception as e:
                 logger.error("PolicyGuard: %s", e)
+        if do_purge:
+            try:
+                _purge_downloads(mode)
+            except Exception as e:
+                logger.error("PolicyGuard purge: %s", e)
 
+        ticks += 1
+        interval = 0.2 if mode in (MODE_WAITING, MODE_SESSION) else 1.0
         _wake.wait(interval)
         _wake.clear()
 
@@ -368,7 +467,9 @@ def set_mode(mode):
         return
 
     _apply_download_policies(mode)
-    _apply_shell_policies(True)
+    _apply_shell_policies(mode)
+    if mode == MODE_SESSION:
+        browser_download_block.close_browsers()
     _purge_counter = 0
     _wake.set()
 
@@ -386,7 +487,7 @@ def stop():
     global _thread, _mode, _download_policy_mode, _purge_counter
     _stop.set()
     _wake.set()
-    _apply_shell_policies(False)
+    _apply_shell_policies(MODE_OFF)
     browser_download_block.disable()
     with _lock:
         if _thread and _thread.is_alive():

@@ -118,51 +118,90 @@ def _update_modifiers(vk, is_keydown):
         _shift_down = is_keydown
 
 
+# LRESULT на 64-bit — указатель. c_long здесь 32 бита, из-за этого Windows
+# игнорирует «проглоченную» клавишу и Win / Alt+Tab проходят.
+_LRESULT = ctypes.c_ssize_t
+_HOOKPROC = ctypes.WINFUNCTYPE(
+    _LRESULT,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+_hook_proc = None
+_user32_ready = False
+
+
+def _prepare_user32(user32):
+    global _user32_ready
+    if _user32_ready:
+        return
+    user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int,
+        _HOOKPROC,
+        wintypes.HINSTANCE,
+        wintypes.DWORD,
+    ]
+    user32.SetWindowsHookExW.restype = wintypes.HHOOK
+    user32.CallNextHookEx.argtypes = [
+        wintypes.HHOOK,
+        ctypes.c_int,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.CallNextHookEx.restype = _LRESULT
+    user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG),
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = _LRESULT
+    _user32_ready = True
+
+
 def listen():
-    global _running, _hook_id, _listener_thread_id
+    global _running, _hook_id, _listener_thread_id, _hook_proc
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    _prepare_user32(user32)
     _listener_thread_id = kernel32.GetCurrentThreadId()
     kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
 
     def low_level_handler(nCode, wParam, lParam):
-        if nCode < 0 or not _running:
-            return user32.CallNextHookEx(_hook_id, nCode, wParam, lParam)
+        try:
+            if nCode >= 0 and _running:
+                is_keydown = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                is_keyup = wParam in (WM_KEYUP, WM_SYSKEYUP)
+                if is_keydown or is_keyup:
+                    kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    vk = kb.vkCode
+                    alt_held = bool(kb.flags & LLKHF_ALTDOWN) or _alt_down
+                    if (
+                        not alt_held
+                        and _keyboard_mode == MODE_STRICT
+                        and vk in (win32con.VK_TAB, win32con.VK_ESCAPE, win32con.VK_F4)
+                    ):
+                        alt_held = bool(user32.GetAsyncKeyState(win32con.VK_MENU) & 0x8000)
+                    _update_modifiers(vk, is_keydown)
+                    if _should_block(vk, is_keydown, alt_held):
+                        return 1
+        except Exception:
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+        return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        is_keydown = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-        is_keyup = wParam in (WM_KEYUP, WM_SYSKEYUP)
-        if not (is_keydown or is_keyup):
-            return user32.CallNextHookEx(_hook_id, nCode, wParam, lParam)
-
-        kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-        vk = kb.vkCode
-        alt_held = bool(kb.flags & LLKHF_ALTDOWN) or _alt_down
-        if (
-            not alt_held
-            and _keyboard_mode == MODE_STRICT
-            and vk in (win32con.VK_TAB, win32con.VK_ESCAPE, win32con.VK_F4)
-        ):
-            alt_held = bool(user32.GetAsyncKeyState(win32con.VK_MENU) & 0x8000)
-
-        _update_modifiers(vk, is_keydown)
-
-        if _should_block(vk, is_keydown, alt_held):
-            return 1
-
-        return user32.CallNextHookEx(_hook_id, nCode, wParam, lParam)
-
-    hook_proc = ctypes.CFUNCTYPE(
-        ctypes.c_long,
-        ctypes.c_int,
-        wintypes.WPARAM,
-        wintypes.LPARAM,
-    )(low_level_handler)
-
+    _hook_proc = _HOOKPROC(low_level_handler)
+    # Для WH_KEYBOARD_LL модуль должен быть NULL, процедура живёт в этом процессе.
     _hook_id = user32.SetWindowsHookExW(
         win32con.WH_KEYBOARD_LL,
-        hook_proc,
-        win32api.GetModuleHandle(None),
+        _hook_proc,
+        None,
         0,
     )
 
@@ -317,3 +356,11 @@ def taskbar(active=True):
     global _hide_taskbar
     _hide_taskbar = not active
     _apply_taskbar_visibility()
+
+
+def set_foreground_lock(enabled):
+    """В ожидании другие окна не должны забирать фокус (Alt+Tab)."""
+    try:
+        ctypes.windll.user32.LockSetForegroundWindow(1 if enabled else 2)
+    except Exception as e:
+        logger.debug("LockSetForegroundWindow: %s", e)

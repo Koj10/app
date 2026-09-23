@@ -1,4 +1,4 @@
-VERSION = "1.1.8"
+VERSION = "1.1.9"
 
 import atexit
 import os
@@ -473,6 +473,7 @@ def _enter_waiting():
 
     logger.info("Режим: ожидание")
     _show_waiting_window()
+    block_keyboard.set_foreground_lock(True)
     block_keyboard.set_mode(block_keyboard.MODE_STRICT, hide_taskbar=True)
     policy_guard.set_mode(policy_guard.MODE_WAITING)
 
@@ -487,6 +488,7 @@ def _enter_session():
         return
 
     logger.info("Режим: игровая сессия")
+    block_keyboard.set_foreground_lock(False)
     # Сначала снимаем запрет explorer, иначе PolicyGuard успевает убить только что запущенный рабочий стол.
     policy_guard.set_mode(policy_guard.MODE_SESSION)
     block_keyboard.set_mode(block_keyboard.MODE_SESSION, hide_taskbar=False)
@@ -518,6 +520,7 @@ def _enter_admin():
         return
 
     logger.info("Режим: администратор")
+    block_keyboard.set_foreground_lock(False)
     block_keyboard.set_mode(block_keyboard.MODE_OFF, hide_taskbar=False)
     policy_guard.set_mode(policy_guard.MODE_OFF)
     _show_admin_window()
