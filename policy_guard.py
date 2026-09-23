@@ -146,8 +146,12 @@ def _is_installer(name):
 
 def _targets_for_mode(mode):
     targets = set()
-    if mode in (MODE_WAITING, MODE_SESSION):
+    if mode == MODE_WAITING:
         targets |= _SHELL_TOOLS
+    elif mode == MODE_SESSION:
+        # В сессии explorer нужен для Alt+Tab и переключения окон
+        session_block = _SHELL_TOOLS - {"explorer.exe"}
+        targets |= session_block
     if mode == MODE_SESSION:
         for name in _list_process_names():
             if _is_installer(name):

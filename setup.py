@@ -2,6 +2,8 @@ from cx_Freeze import setup, Executable
 import sys
 import re
 import os
+import glob
+
 
 def get_version_from_file(file_path: str, version_var: str = "VERSION"):
     with open(file_path, "r", encoding="utf-8") as f:
@@ -11,6 +13,44 @@ def get_version_from_file(file_path: str, version_var: str = "VERSION"):
     if match:
         return match.group(1) or match.group(2)
     return None
+
+
+def _collect_runtime_dlls():
+    """VC++ runtime и python3*.dll — без них на чистом Windows будет ошибка VCRUNTIME140.dll."""
+    names = {
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "msvcp140.dll",
+    }
+    py_dll = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+    names.add(py_dll.lower())
+
+    roots = [
+        sys.base_prefix,
+        os.path.join(sys.base_prefix, "DLLs"),
+        os.path.dirname(sys.executable),
+    ]
+    if os.environ.get("SystemRoot"):
+        roots.append(os.path.join(os.environ["SystemRoot"], "System32"))
+
+    found = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for name in names:
+            if name in seen:
+                continue
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                found.append(path)
+                seen.add(name)
+
+    missing = names - seen
+    if missing:
+        print(f"WARN: не найдены runtime DLL: {', '.join(sorted(missing))}")
+    return found
+
 
 version = get_version_from_file("app.py")
 
@@ -24,8 +64,17 @@ if sys.platform == "win32":
 
 icon_file = "logo.ico"
 
+runtime_dlls = _collect_runtime_dlls()
+
 build_exe_options = {
-    "include_files": [icon_file],
+    "include_files": [icon_file] + runtime_dlls,
+    "packages": [
+        "win32api",
+        "win32con",
+        "win32gui",
+        "win32com",
+        "win32com.client",
+    ],
 }
 
 msi_options = {

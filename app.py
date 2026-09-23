@@ -1,4 +1,4 @@
-VERSION = "1.1.1"
+VERSION = "1.1.3"
 
 import atexit
 import os
@@ -78,6 +78,47 @@ _ntp_synced_at = 0.0
 logger.info("Версия: %s", VERSION)
 
 
+class ShellApi:
+    """API для кнопок на сайте внутри shell."""
+
+    def minimize_to_desktop(self):
+        minimize_to_desktop()
+        return True
+
+    def restore_app(self):
+        restore_app_window()
+        return True
+
+    def is_shell(self):
+        return True
+
+
+def minimize_to_desktop():
+    with _ui_lock:
+        if not window:
+            return
+        try:
+            hwnd = _find_hwnd()
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                logger.info("GameSense свёрнут на рабочий стол")
+        except Exception as e:
+            logger.error("minimize_to_desktop: %s", e)
+
+
+def restore_app_window():
+    with _ui_lock:
+        if not window:
+            return
+        try:
+            hwnd = _find_hwnd()
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+        except Exception as e:
+            logger.error("restore_app_window: %s", e)
+
+
 def _sync_ntp(force=False):
     global _ntp_offset, _ntp_synced_at
     now = time.monotonic()
@@ -111,6 +152,15 @@ def _session_expired(response_data):
     now_time = _now_local().replace(tzinfo=None)
     now_time += timedelta(hours=time_zone)
     return now_time > time_active
+
+
+def _on_closing():
+    if DEBUG:
+        return True
+    if _mode in ("waiting", "session"):
+        logger.debug("Закрытие заблокировано (режим %s)", _mode)
+        return False
+    return True
 
 
 def edit_status():
@@ -160,24 +210,6 @@ def _native_show(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
 
 
-def _native_minimize(hwnd):
-    if hwnd:
-        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-
-
-def _restore_from_minimize():
-    with _ui_lock:
-        if not window:
-            return
-        try:
-            hwnd = _find_hwnd()
-            if hwnd:
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(hwnd)
-        except Exception as e:
-            logger.error("restore window: %s", e)
-
-
 def _show_in_taskbar(hwnd):
     if not hwnd:
         return
@@ -202,7 +234,7 @@ def _show_waiting_window():
             hwnd = _find_hwnd()
             _show_in_taskbar(hwnd)
             _native_move_resize(hwnd, screen_width, screen_height, topmost=True)
-            window_guard.protect(hwnd)
+            window_guard.protect(hwnd, block_close=True)
         except Exception as e:
             logger.error("_show_waiting_window: %s", e)
 
@@ -219,7 +251,7 @@ def _show_session_window():
             hwnd = _find_hwnd()
             _show_in_taskbar(hwnd)
             _native_move_resize(hwnd, screen_width, screen_height, topmost=False)
-            window_guard.protect(hwnd)
+            window_guard.protect(hwnd, block_close=True)
             _native_show(hwnd)
         except Exception as e:
             logger.error("_show_session_window: %s", e)
@@ -251,10 +283,15 @@ def _maybe_launch_repair_tool():
 
 def _start_explorer():
     try:
-        subprocess.Popen(
-            ["explorer.exe"],
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq explorer.exe", "/NH"],
+            capture_output=True,
+            text=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=5,
         )
+        if "explorer.exe" not in (result.stdout or "").lower():
+            subprocess.Popen(["explorer.exe"])
     except Exception as e:
         logger.debug("start explorer: %s", e)
 
@@ -275,6 +312,7 @@ def _enter_waiting():
 
 def _enter_session():
     global _mode
+    first_entry = _mode != "session"
     if _mode == "session":
         return
     _mode = "session"
@@ -282,9 +320,18 @@ def _enter_session():
         return
 
     logger.info("Режим: игровая сессия")
+    _start_explorer()
     _show_session_window()
     block_keyboard.set_mode(block_keyboard.MODE_SESSION, hide_taskbar=False)
     policy_guard.set_mode(policy_guard.MODE_SESSION)
+
+    if first_entry and window:
+        try:
+            window.evaluate_js(
+                "window.dispatchEvent(new CustomEvent('gs-session-started'));"
+            )
+        except Exception as e:
+            logger.debug("session js event: %s", e)
 
 
 def _enter_admin():
@@ -387,11 +434,13 @@ def start_app():
             "GameSense",
             f"{SITE_BASE}/login_pc/{token}",
             fullscreen=True,
-            confirm_close=True,
+            confirm_close=False,
             background_color="#110e1a",
+            js_api=ShellApi(),
         )
         window.events.loaded += _on_window_loaded
-        block_keyboard.start_hotkey(_restore_from_minimize)
+        window.events.closing += _on_closing
+        block_keyboard.start_hotkey(restore_app_window)
         threading.Thread(target=_check_updates_background, daemon=True, name="updates").start()
         webview.start(api_loop, window, debug=DEBUG)
     except Exception as e:
