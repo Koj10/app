@@ -71,17 +71,19 @@ def _unhook():
         _hook_id = None
 
 
+def _is_win_key(vk, scan_code):
+    return vk in (win32con.VK_LWIN, win32con.VK_RWIN) or (scan_code & 0xFF) in (0x5B, 0x5C)
+
+
 def _should_block(vk, is_keydown, alt_held, scan_code):
     mode = _keyboard_mode
     if mode == MODE_OFF:
         return False
 
-    # Меню Пуск открывается на отпускании Win, поэтому гасим и нажатие, и отпускание.
-    # На части клавиатур vk приходит не как LWIN/RWIN, но сканкод остаётся 0x5B/0x5C.
-    if vk in (win32con.VK_LWIN, win32con.VK_RWIN) or scan_code in (0x5B, 0x5C):
-        return True
-
     if mode == MODE_STRICT:
+        # До активации пакета и снова после его конца Win не доходит до меню Пуск.
+        if _is_win_key(vk, scan_code):
+            return True
         if alt_held and vk in (
             win32con.VK_TAB,
             win32con.VK_ESCAPE,
@@ -200,11 +202,7 @@ def listen():
                         alt_held = bool(user32.GetAsyncKeyState(win32con.VK_MENU) & 0x8000)
                     _update_modifiers(vk, is_keydown)
                     if _should_block(vk, is_keydown, alt_held, scan_code):
-                        win_key = vk in (win32con.VK_LWIN, win32con.VK_RWIN) or scan_code in (
-                            0x5B,
-                            0x5C,
-                        )
-                        if win_key and _keyboard_mode == MODE_STRICT:
+                        if _is_win_key(vk, scan_code) and _keyboard_mode == MODE_STRICT:
                             callback = _on_win_key
                             if callback is not None:
                                 callback()
@@ -321,16 +319,16 @@ def set_mode(mode, hide_taskbar=False):
 
         if mode == MODE_OFF:
             stop_block_unlocked()
-            return
-
-        if _running or (_listener_thread and _listener_thread.is_alive()):
+        elif not (_running or (_listener_thread and _listener_thread.is_alive())):
+            _stop_event.clear()
+            logger.debug("Блокировка клавиш: режим %s", mode)
+            _listener_thread = threading.Thread(target=listen, daemon=True, name="keyboard-block")
+            _listener_thread.start()
+        else:
             logger.debug("Клавиатура: режим %s", mode)
-            return
 
-        _stop_event.clear()
-        logger.debug("Блокировка клавиш: режим %s", mode)
-        _listener_thread = threading.Thread(target=listen, daemon=True, name="keyboard-block")
-        _listener_thread.start()
+    # Клавиша Win заблокирована только в ожидании. В сессии снимается, после пакета включается снова.
+    set_win_key_block(mode == MODE_STRICT)
 
 
 def stop_block_unlocked():
@@ -363,6 +361,7 @@ def stop_block_unlocked():
 def stop_block():
     with _lock:
         stop_block_unlocked()
+    set_win_key_block(False)
 
 
 def start_block(mode=MODE_STRICT, hide_taskbar=True):
@@ -381,3 +380,265 @@ def set_foreground_lock(enabled):
         ctypes.windll.user32.LockSetForegroundWindow(1 if enabled else 2)
     except Exception as e:
         logger.debug("LockSetForegroundWindow: %s", e)
+
+
+# Системная блокировка Win: пока регистрация жива, оболочка не открывает Пуск.
+# Снимается в сессии и включается снова, когда пакет закончился.
+_RIDEV_REMOVE = 0x00000001
+_RIDEV_INPUTSINK = 0x00000100
+_RIDEV_NOHOTKEYS = 0x00000200
+_RID_INPUT = 0x10000003
+_WM_INPUT = 0x00FF
+_WM_WIN_ON = 0x8001
+_WM_WIN_OFF = 0x8002
+_WIN_BLOCK_CLASS = "GameSenseWinBlock"
+
+_win_block_thread = None
+_win_block_hwnd = None
+_win_block_proc = None
+_win_block_ready = threading.Event()
+_win_block_enabled = False
+_win_block_api_ready = False
+_raw_win_blocked = False
+
+
+class _RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", wintypes.USHORT),
+        ("usUsage", wintypes.USHORT),
+        ("dwFlags", wintypes.DWORD),
+        ("hwndTarget", wintypes.HWND),
+    ]
+
+
+class _RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", wintypes.DWORD),
+        ("dwSize", wintypes.DWORD),
+        ("hDevice", wintypes.HANDLE),
+        ("wParam", wintypes.WPARAM),
+    ]
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t,
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", _WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+def _prepare_win_block_api():
+    global _win_block_api_ready
+    if _win_block_api_ready:
+        return
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.RegisterRawInputDevices.argtypes = [
+        ctypes.POINTER(_RAWINPUTDEVICE),
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.RegisterRawInputDevices.restype = wintypes.BOOL
+    user32.GetRawInputData.argtypes = [
+        ctypes.c_void_p,
+        wintypes.UINT,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.UINT),
+        wintypes.UINT,
+    ]
+    user32.GetRawInputData.restype = wintypes.UINT
+    user32.DefWindowProcW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        wintypes.HMENU,
+        wintypes.HINSTANCE,
+        wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.PostMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG),
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+    _win_block_api_ready = True
+
+
+def _drain_raw_input(lparam):
+    user32 = ctypes.windll.user32
+    size = wintypes.UINT(0)
+    header = ctypes.sizeof(_RAWINPUTHEADER)
+    user32.GetRawInputData(lparam, _RID_INPUT, None, ctypes.byref(size), header)
+    if not size.value:
+        return
+    buf = ctypes.create_string_buffer(size.value)
+    user32.GetRawInputData(lparam, _RID_INPUT, buf, ctypes.byref(size), header)
+
+
+def _apply_raw_win_block(hwnd, enabled):
+    global _raw_win_blocked
+    user32 = ctypes.windll.user32
+    rid = _RAWINPUTDEVICE()
+    rid.usUsagePage = 0x01
+    rid.usUsage = 0x06
+    if enabled:
+        rid.dwFlags = _RIDEV_INPUTSINK | _RIDEV_NOHOTKEYS
+        rid.hwndTarget = hwnd
+    else:
+        rid.dwFlags = _RIDEV_REMOVE
+        rid.hwndTarget = None
+    ok = user32.RegisterRawInputDevices(
+        ctypes.byref(rid), 1, ctypes.sizeof(_RAWINPUTDEVICE)
+    )
+    if not ok:
+        logger.warning(
+            "Не удалось %s клавишу Win: %s",
+            "заблокировать" if enabled else "разблокировать",
+            ctypes.windll.kernel32.GetLastError(),
+        )
+        return
+    if enabled != _raw_win_blocked:
+        _raw_win_blocked = enabled
+        logger.info("Клавиша Win %s", "заблокирована" if enabled else "разблокирована")
+
+
+def _win_block_wndproc(hwnd, msg, wparam, lparam):
+    try:
+        if msg == _WM_INPUT:
+            _drain_raw_input(lparam)
+            return 0
+        if msg == _WM_WIN_ON:
+            _apply_raw_win_block(hwnd, True)
+            return 0
+        if msg == _WM_WIN_OFF:
+            _apply_raw_win_block(hwnd, False)
+            return 0
+    except Exception as e:
+        logger.debug("win block wnd: %s", e)
+        return 0
+    return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def _win_block_thread_main():
+    global _win_block_hwnd, _win_block_proc
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    _prepare_win_block_api()
+    hinst = kernel32.GetModuleHandleW(None)
+    _win_block_proc = _WNDPROC(_win_block_wndproc)
+    wc = _WNDCLASSW()
+    wc.lpfnWndProc = _win_block_proc
+    wc.hInstance = hinst
+    wc.lpszClassName = _WIN_BLOCK_CLASS
+    if not user32.RegisterClassW(ctypes.byref(wc)):
+        err = kernel32.GetLastError()
+        if err not in (0, 1410):
+            logger.warning("Не удалось зарегистрировать блокировку Win: %s", err)
+            _win_block_ready.set()
+            return
+    hwnd = user32.CreateWindowExW(
+        0,
+        _WIN_BLOCK_CLASS,
+        _WIN_BLOCK_CLASS,
+        0,
+        0,
+        0,
+        0,
+        0,
+        wintypes.HWND(-3),
+        None,
+        hinst,
+        None,
+    )
+    _win_block_hwnd = hwnd
+    _win_block_ready.set()
+    if not hwnd:
+        logger.warning("Не удалось создать окно блокировки Win: %s", kernel32.GetLastError())
+        return
+    if _win_block_enabled:
+        _apply_raw_win_block(hwnd, True)
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+
+def _ensure_win_block_thread():
+    global _win_block_thread
+    if _win_block_thread and _win_block_thread.is_alive():
+        return
+    _win_block_ready.clear()
+    _win_block_thread = threading.Thread(
+        target=_win_block_thread_main, daemon=True, name="win-key-block"
+    )
+    _win_block_thread.start()
+
+
+def set_win_key_block(enabled):
+    """Блокирует клавишу Win, пока клиент в ожидании. В сессии и у админа снимается."""
+    global _win_block_enabled
+
+    enabled = bool(enabled)
+    _win_block_enabled = enabled
+    if not enabled and not (_win_block_thread and _win_block_thread.is_alive()):
+        return
+
+    _ensure_win_block_thread()
+    if not _win_block_ready.wait(2.0):
+        logger.warning("Блокировка клавиши Win не подготовилась")
+        return
+    hwnd = _win_block_hwnd
+    if not hwnd:
+        return
+    _prepare_win_block_api()
+    ctypes.windll.user32.PostMessageW(
+        hwnd, _WM_WIN_ON if enabled else _WM_WIN_OFF, 0, 0
+    )

@@ -30,6 +30,19 @@ _download_policy_mode = None
 _shell_policy_mode = None
 _purge_counter = 0
 _taskmgr_kill = None
+_suspend_lock = threading.Lock()
+_suspended_start = set()
+_start_held_logged = False
+
+# Меню Пуск Windows 11. В ожидании процесс замораживается, в сессии снова работает.
+_START_HOSTS = frozenset(
+    {
+        "startmenuexperiencehost.exe",
+        "searchhost.exe",
+    }
+)
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SUSPEND_RESUME = 0x0800
 
 # Все буквы дисков A–Z.
 _ALL_DRIVES = 0x03FFFFFF
@@ -394,64 +407,177 @@ def _prepare_native():
     user32.ShowWindowAsync.restype = wintypes.BOOL
     user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.keybd_event.argtypes = [
+        wintypes.BYTE,
+        wintypes.BYTE,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+    ]
+    user32.keybd_event.restype = None
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    ntdll = ctypes.windll.ntdll
+    ntdll.NtSuspendProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtSuspendProcess.restype = ctypes.c_long
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = ctypes.c_long
     _native_ready = True
 
 
-def _hide_start_ui():
-    """Панель Пуска на Windows 11 рисует StartMenuExperienceHost, даже если клавиша Win съедена."""
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+def _start_host_pids():
+    _prepare_native()
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid = ctypes.c_void_p(-1).value
+    if not snapshot or snapshot == invalid:
+        return set()
+    found = set()
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return set()
+        while True:
+            if entry.szExeFile.lower() in _START_HOSTS and entry.th32ProcessID:
+                found.add(entry.th32ProcessID)
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return found
+
+
+def _visible_pids(pids):
+    if not pids:
+        return set()
     _prepare_native()
     user32 = ctypes.windll.user32
-    hosts = {
-        "startmenuexperiencehost.exe",
-        "searchhost.exe",
-        "shellexperiencehost.exe",
-    }
-
-    def _exe_name(pid):
-        if not pid:
-            return ""
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return ""
-        try:
-            size = wintypes.DWORD(260)
-            buf = ctypes.create_unicode_buffer(260)
-            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-                return ""
-            return os.path.basename(buf.value).lower()
-        finally:
-            kernel32.CloseHandle(handle)
+    found = set()
 
     def _enum(hwnd, _):
         try:
             if not win32gui.IsWindowVisible(hwnd):
                 return True
-            class_name = win32gui.GetClassName(hwnd)
         except Exception:
-            return True
-        if class_name not in (
-            "Windows.UI.Core.CoreWindow",
-            "XamlExplorerHostIslandWindow",
-            "ApplicationFrameWindow",
-            "MultitaskingViewFrame",
-        ):
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
-        if class_name != "MultitaskingViewFrame" and _exe_name(pid.value) not in hosts:
-            return True
-        try:
-            user32.ShowWindowAsync(int(hwnd), win32con.SW_HIDE)
-            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-        except Exception as e:
-            logger.debug("hide start: %s", e)
+        if pid.value in pids:
+            found.add(pid.value)
+            try:
+                user32.ShowWindowAsync(int(hwnd), win32con.SW_HIDE)
+            except Exception as e:
+                logger.debug("hide start: %s", e)
         return True
 
     try:
         win32gui.EnumWindows(_enum, None)
     except Exception as e:
-        logger.debug("hide start enum: %s", e)
+        logger.debug("start enum: %s", e)
+    return found
+
+
+def _open_process(pid, access):
+    handle = ctypes.windll.kernel32.OpenProcess(access, False, pid)
+    return handle or None
+
+
+def _terminate_pid(pid):
+    handle = _open_process(pid, _PROCESS_TERMINATE)
+    if not handle:
+        return False
+    kernel32 = ctypes.windll.kernel32
+    try:
+        return bool(kernel32.TerminateProcess(handle, 1))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _suspend_pid(pid):
+    handle = _open_process(pid, _PROCESS_SUSPEND_RESUME)
+    if not handle:
+        return False
+    kernel32 = ctypes.windll.kernel32
+    try:
+        return ctypes.windll.ntdll.NtSuspendProcess(handle) == 0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _resume_pid(pid):
+    handle = _open_process(pid, _PROCESS_SUSPEND_RESUME)
+    if not handle:
+        return
+    kernel32 = ctypes.windll.kernel32
+    ntdll = ctypes.windll.ntdll
+    try:
+        for _ in range(8):
+            ntdll.NtResumeProcess(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _cancel_start_gesture():
+    """VK_E8 — системная клавиша, которой оболочка отменяет открытие Пуска."""
+    _prepare_native()
+    user32 = ctypes.windll.user32
+    user32.keybd_event(0xE8, 0, 0, 0)
+    user32.keybd_event(0xE8, 0, 0x0002, 0)
+
+
+def _hold_start_menu():
+    """В ожидании Пуск не рисуется: хост заморожен, уже открытое окно закрывается."""
+    global _start_held_logged
+
+    pids = _start_host_pids()
+    with _suspend_lock:
+        with _lock:
+            if _mode != MODE_WAITING:
+                return
+        visible = _visible_pids(pids)
+        changed = False
+        for pid in pids:
+            if pid in visible:
+                if _terminate_pid(pid):
+                    changed = True
+                _suspended_start.discard(pid)
+            elif pid not in _suspended_start and _suspend_pid(pid):
+                _suspended_start.add(pid)
+                changed = True
+        if changed and not _start_held_logged:
+            logger.info("PolicyGuard: меню Пуск заблокировано")
+            _start_held_logged = True
+
+
+def _release_start_menu():
+    """Снимает заморозку Пуска, когда пакет активирован или включён режим админа."""
+    global _start_held_logged
+
+    pids = _start_host_pids()
+    with _suspend_lock:
+        for pid in set(_suspended_start) | set(pids):
+            _resume_pid(pid)
+        _suspended_start.clear()
+        _start_held_logged = False
 
 
 def _on_win_key():
@@ -566,7 +692,10 @@ def _loop():
             mode = _mode
 
         if mode == MODE_WAITING:
-            _hide_start_ui()
+            if _win_pressed.is_set():
+                _win_pressed.clear()
+                _cancel_start_gesture()
+            _hold_start_menu()
             _close_window_classes(
                 _FILE_WINDOW_CLASSES | _TASKMGR_WINDOW_CLASSES | _SWITCHER_WINDOW_CLASSES
             )
@@ -601,7 +730,6 @@ def _loop():
             interval = 1.0
         _wake.wait(interval)
         _wake.clear()
-        _win_pressed.clear()
 
 
 def set_mode(mode):
@@ -615,6 +743,11 @@ def set_mode(mode):
     if mode == MODE_OFF:
         stop()
         return
+
+    if mode == MODE_WAITING:
+        _hold_start_menu()
+    else:
+        _release_start_menu()
 
     _apply_download_policies(mode)
     _apply_shell_policies(mode)
@@ -635,17 +768,21 @@ def set_mode(mode):
 
 def stop():
     global _thread, _mode, _download_policy_mode, _purge_counter
+    with _lock:
+        _mode = MODE_OFF
     _stop.set()
     _wake.set()
     _apply_shell_policies(MODE_OFF)
     browser_download_block.disable()
+    thread = None
     with _lock:
-        if _thread and _thread.is_alive():
-            _thread.join(timeout=2.0)
+        thread = _thread
         _thread = None
-        _mode = MODE_OFF
         _download_policy_mode = None
         _purge_counter = 0
+    if thread and thread.is_alive():
+        thread.join(timeout=2.0)
+    _release_start_menu()
     _stop.clear()
     _wake.clear()
 
