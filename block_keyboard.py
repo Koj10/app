@@ -71,13 +71,14 @@ def _unhook():
         _hook_id = None
 
 
-def _should_block(vk, is_keydown, alt_held):
+def _should_block(vk, is_keydown, alt_held, scan_code):
     mode = _keyboard_mode
     if mode == MODE_OFF:
         return False
 
     # Меню Пуск открывается на отпускании Win, поэтому гасим и нажатие, и отпускание.
-    if vk in (win32con.VK_LWIN, win32con.VK_RWIN):
+    # На части клавиатур vk приходит не как LWIN/RWIN, но сканкод остаётся 0x5B/0x5C.
+    if vk in (win32con.VK_LWIN, win32con.VK_RWIN) or scan_code in (0x5B, 0x5C):
         return True
 
     if mode == MODE_STRICT:
@@ -129,6 +130,13 @@ _HOOKPROC = ctypes.WINFUNCTYPE(
 )
 _hook_proc = None
 _user32_ready = False
+_on_win_key = None
+
+
+def set_on_win_key(callback):
+    """Мгновенный сигнал, что нажата Win. Колбэк не должен делать ничего тяжёлого."""
+    global _on_win_key
+    _on_win_key = callback
 
 
 def _prepare_user32(user32):
@@ -182,6 +190,7 @@ def listen():
                 if is_keydown or is_keyup:
                     kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                     vk = kb.vkCode
+                    scan_code = kb.scanCode
                     alt_held = bool(kb.flags & LLKHF_ALTDOWN) or _alt_down
                     if (
                         not alt_held
@@ -190,7 +199,15 @@ def listen():
                     ):
                         alt_held = bool(user32.GetAsyncKeyState(win32con.VK_MENU) & 0x8000)
                     _update_modifiers(vk, is_keydown)
-                    if _should_block(vk, is_keydown, alt_held):
+                    if _should_block(vk, is_keydown, alt_held, scan_code):
+                        win_key = vk in (win32con.VK_LWIN, win32con.VK_RWIN) or scan_code in (
+                            0x5B,
+                            0x5C,
+                        )
+                        if win_key and _keyboard_mode == MODE_STRICT:
+                            callback = _on_win_key
+                            if callback is not None:
+                                callback()
                         return 1
         except Exception:
             return user32.CallNextHookEx(None, nCode, wParam, lParam)

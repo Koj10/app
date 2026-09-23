@@ -24,6 +24,7 @@ _lock = threading.Lock()
 _thread = None
 _stop = threading.Event()
 _wake = threading.Event()
+_win_pressed = threading.Event()
 _mode = MODE_OFF
 _download_policy_mode = None
 _shell_policy_mode = None
@@ -221,8 +222,47 @@ def _enforce_processes(mode):
             _kill_process(name)
 
 
-def _kill_taskmgr():
-    """Диспетчер задач гасится сразу, не раз в несколько секунд."""
+def _kill_taskmgr(force_image=False):
+    """Закрыть диспетчер задач по окну и по имени процесса. WM_CLOSE он часто игнорирует."""
+    _prepare_native()
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    found = False
+
+    def _terminate(pid):
+        if not pid:
+            return
+        handle = kernel32.OpenProcess(0x0001, False, pid)
+        if not handle:
+            return
+        try:
+            kernel32.TerminateProcess(handle, 1)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def _enum(hwnd, _):
+        nonlocal found
+        try:
+            title = win32gui.GetWindowText(hwnd) or ""
+            class_name = win32gui.GetClassName(hwnd)
+        except Exception:
+            return True
+        if class_name != "TaskManagerWindow" and title not in ("Диспетчер задач", "Task Manager"):
+            return True
+        found = True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        _terminate(pid.value)
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum, None)
+    except Exception as e:
+        logger.debug("taskmgr enum: %s", e)
+
+    if not found and not force_image:
+        return
+
     global _taskmgr_kill
     if _taskmgr_kill is not None and _taskmgr_kill.poll() is None:
         return
@@ -238,8 +278,9 @@ def _kill_taskmgr():
 
 
 def _set_dword(root, path, name, value):
+    access = winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY | winreg.KEY_WOW64_64KEY
     try:
-        key = winreg.CreateKeyEx(root, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY)
+        key = winreg.CreateKeyEx(root, path, 0, access)
         winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
         winreg.CloseKey(key)
         return True
@@ -250,7 +291,9 @@ def _set_dword(root, path, name, value):
 
 def _delete_value(root, path, name):
     try:
-        key = winreg.OpenKeyEx(root, path, 0, winreg.KEY_SET_VALUE)
+        key = winreg.OpenKeyEx(
+            root, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+        )
     except FileNotFoundError:
         return True
     except OSError as e:
@@ -292,10 +335,12 @@ def _apply_shell_policies(mode):
         _set_dword(winreg.HKEY_LOCAL_MACHINE, _TASKMGR_POLICY, "DisableTaskMgr", 1)
         if not _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoWinKeys", 1):
             logger.warning("Не удалось отключить клавишу Win через реестр")
+        _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoTrayContextMenu", 1)
     else:
         _delete_value(winreg.HKEY_CURRENT_USER, _TASKMGR_POLICY, "DisableTaskMgr")
         _delete_value(winreg.HKEY_LOCAL_MACHINE, _TASKMGR_POLICY, "DisableTaskMgr")
         _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoWinKeys")
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoTrayContextMenu")
 
     if mode == MODE_SESSION:
         drives_hidden = _set_dword(
@@ -316,6 +361,102 @@ def _apply_shell_policies(mode):
 
     _broadcast_policy()
     _shell_policy_mode = mode
+
+
+_native_ready = False
+
+
+def _prepare_native():
+    global _native_ready
+    if _native_ready:
+        return
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindowAsync.restype = wintypes.BOOL
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    _native_ready = True
+
+
+def _hide_start_ui():
+    """Панель Пуска на Windows 11 рисует StartMenuExperienceHost, даже если клавиша Win съедена."""
+    _prepare_native()
+    user32 = ctypes.windll.user32
+    hosts = {
+        "startmenuexperiencehost.exe",
+        "searchhost.exe",
+        "shellexperiencehost.exe",
+    }
+
+    def _exe_name(pid):
+        if not pid:
+            return ""
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(260)
+            buf = ctypes.create_unicode_buffer(260)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return ""
+            return os.path.basename(buf.value).lower()
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def _enum(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            class_name = win32gui.GetClassName(hwnd)
+        except Exception:
+            return True
+        if class_name not in (
+            "Windows.UI.Core.CoreWindow",
+            "XamlExplorerHostIslandWindow",
+            "ApplicationFrameWindow",
+            "MultitaskingViewFrame",
+        ):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        if class_name != "MultitaskingViewFrame" and _exe_name(pid.value) not in hosts:
+            return True
+        try:
+            user32.ShowWindowAsync(int(hwnd), win32con.SW_HIDE)
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception as e:
+            logger.debug("hide start: %s", e)
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum, None)
+    except Exception as e:
+        logger.debug("hide start enum: %s", e)
+
+
+def _on_win_key():
+    _win_pressed.set()
+    _wake.set()
 
 
 def _close_window_classes(classes):
@@ -341,6 +482,7 @@ def _close_window_classes(classes):
 
 
 def _refocus_shell():
+    _prepare_native()
     user32 = ctypes.windll.user32
     shell = win32gui.FindWindow(None, "GameSense")
     if not shell:
@@ -355,8 +497,9 @@ def _refocus_shell():
         return
 
     try:
-        fg_thread = user32.GetWindowThreadProcessId(foreground, None)
-        shell_thread = user32.GetWindowThreadProcessId(shell, None)
+        fg_thread = user32.GetWindowThreadProcessId(foreground, ctypes.byref(pid))
+        shell_pid = wintypes.DWORD()
+        shell_thread = user32.GetWindowThreadProcessId(shell, ctypes.byref(shell_pid))
         current = ctypes.windll.kernel32.GetCurrentThreadId()
         user32.AttachThreadInput(current, fg_thread, True)
         user32.AttachThreadInput(current, shell_thread, True)
@@ -423,6 +566,7 @@ def _loop():
             mode = _mode
 
         if mode == MODE_WAITING:
+            _hide_start_ui()
             _close_window_classes(
                 _FILE_WINDOW_CLASSES | _TASKMGR_WINDOW_CLASSES | _SWITCHER_WINDOW_CLASSES
             )
@@ -430,8 +574,8 @@ def _loop():
         elif mode == MODE_SESSION:
             _close_window_classes(_FILE_WINDOW_CLASSES | _TASKMGR_WINDOW_CLASSES)
 
-        if mode in (MODE_WAITING, MODE_SESSION) and ticks % 3 == 0:
-            _kill_taskmgr()
+        if mode in (MODE_WAITING, MODE_SESSION):
+            _kill_taskmgr(force_image=(ticks % 10 == 0))
 
         do_scan = mode == MODE_WAITING and ticks % 5 == 0
         do_scan = do_scan or (mode == MODE_SESSION and ticks % 10 == 0)
@@ -449,9 +593,15 @@ def _loop():
                 logger.error("PolicyGuard purge: %s", e)
 
         ticks += 1
-        interval = 0.2 if mode in (MODE_WAITING, MODE_SESSION) else 1.0
+        if mode == MODE_WAITING:
+            interval = 0.05
+        elif mode == MODE_SESSION:
+            interval = 0.2
+        else:
+            interval = 1.0
         _wake.wait(interval)
         _wake.clear()
+        _win_pressed.clear()
 
 
 def set_mode(mode):
@@ -498,3 +648,12 @@ def stop():
         _purge_counter = 0
     _stop.clear()
     _wake.clear()
+
+
+def _install_win_callback():
+    import block_keyboard
+
+    block_keyboard.set_on_win_key(_on_win_key)
+
+
+_install_win_callback()
