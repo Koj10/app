@@ -115,6 +115,24 @@ _INSTALLERS = frozenset(
     }
 )
 
+# Параметры и старая панель управления. Только в игровой сессии.
+_SETTINGS_PROCESSES = frozenset(
+    {
+        "systemsettings.exe",
+        "control.exe",
+    }
+)
+_SETTINGS_TITLES = frozenset(
+    {
+        "параметры",
+        "settings",
+        "панель управления",
+        "control panel",
+    }
+)
+_RECYCLE_BIN_CLSID = "{645FF040-5081-101B-9F08-00AA002F954E}"
+_HIDE_DESKTOP_ICONS = r"Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons"
+
 _BLOCKED_DOWNLOAD_EXT = frozenset(
     {
         ".exe",
@@ -212,7 +230,7 @@ def _targets_for_mode(mode, running):
     if mode == MODE_WAITING:
         targets |= _SHELL_TOOLS | _INSTALLERS
     elif mode == MODE_SESSION:
-        targets |= _SHELL_TOOLS - {"explorer.exe"}
+        targets |= (_SHELL_TOOLS - {"explorer.exe"}) | _SETTINGS_PROCESSES
         for name in running:
             if _is_installer(name):
                 targets.add(name)
@@ -290,6 +308,18 @@ def _kill_taskmgr(force_image=False):
         logger.debug("taskkill taskmgr: %s", e)
 
 
+def _set_sz(root, path, name, value):
+    access = winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY | winreg.KEY_WOW64_64KEY
+    try:
+        key = winreg.CreateKeyEx(root, path, 0, access)
+        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+        return True
+    except OSError as e:
+        logger.debug("policy %s: %s", name, e)
+        return False
+
+
 def _set_dword(root, path, name, value):
     access = winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY | winreg.KEY_WOW64_64KEY
     try:
@@ -319,6 +349,85 @@ def _delete_value(root, path, name):
     finally:
         winreg.CloseKey(key)
     return True
+
+
+def _refresh_desktop():
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.SHChangeNotify.argtypes = [
+            ctypes.c_long,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        shell32.SHChangeNotify.restype = None
+        shell32.SHChangeNotify(0x08000000, 0x0000, None, None)
+    except Exception as e:
+        logger.debug("desktop notify: %s", e)
+    try:
+        progman = win32gui.FindWindow("Progman", None)
+        if progman:
+            win32gui.PostMessage(progman, win32con.WM_COMMAND, 0x7402, 0)
+    except Exception as e:
+        logger.debug("desktop refresh: %s", e)
+
+
+def _set_recycle_bin_hidden(hidden):
+    for folder in ("NewStartPanel", "ClassicStartMenu"):
+        path = _HIDE_DESKTOP_ICONS + "\\" + folder
+        if hidden:
+            _set_dword(winreg.HKEY_CURRENT_USER, path, _RECYCLE_BIN_CLSID, 1)
+        else:
+            _delete_value(winreg.HKEY_CURRENT_USER, path, _RECYCLE_BIN_CLSID)
+
+
+def _apply_session_user_lock(enabled):
+    """В сессии нельзя удалять с рабочего стола и открывать Параметры."""
+    if enabled:
+        _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoControlPanel", 1)
+        _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewContextMenu", 1)
+        if not _set_sz(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "SettingsPageVisibility", "hide:*"):
+            logger.warning("Не удалось закрыть параметры через реестр")
+        _set_recycle_bin_hidden(True)
+    else:
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoControlPanel")
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewContextMenu")
+        _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "SettingsPageVisibility")
+        _set_recycle_bin_hidden(False)
+    _refresh_desktop()
+
+
+def _close_settings():
+    _prepare_native()
+    user32 = ctypes.windll.user32
+
+    def _terminate(pid):
+        if not pid:
+            return
+        handle = ctypes.windll.kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return
+        try:
+            ctypes.windll.kernel32.TerminateProcess(handle, 1)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+
+    def _enum(hwnd, _):
+        try:
+            title = (win32gui.GetWindowText(hwnd) or "").strip().casefold()
+        except Exception:
+            return True
+        if title not in _SETTINGS_TITLES:
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        _terminate(pid.value)
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum, None)
+    except Exception as e:
+        logger.debug("settings enum: %s", e)
 
 
 def _broadcast_policy():
@@ -363,10 +472,12 @@ def _apply_shell_policies(mode):
         )
         if not drives_hidden:
             logger.warning("Не удалось закрыть диски в проводнике через реестр")
-        logger.info("PolicyGuard: диски в проводнике закрыты, диспетчер задач отключён")
+        _apply_session_user_lock(True)
+        logger.info("PolicyGuard: диски закрыты, удаление и параметры отключены")
     else:
         _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoDrives")
         _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewOnDrive")
+        _apply_session_user_lock(False)
         if lock:
             logger.info("PolicyGuard: Win и диспетчер задач отключены")
         elif _shell_policy_mode is not None:
@@ -709,6 +820,7 @@ def _loop():
             _refocus_shell()
         elif mode == MODE_SESSION:
             _close_window_classes(_FILE_WINDOW_CLASSES | _TASKMGR_WINDOW_CLASSES)
+            _close_settings()
 
         if mode in (MODE_WAITING, MODE_SESSION):
             _kill_taskmgr(force_image=(ticks % 10 == 0))

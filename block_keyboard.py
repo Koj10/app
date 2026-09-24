@@ -40,6 +40,7 @@ _keyboard_mode = MODE_OFF
 _alt_down = False
 _ctrl_down = False
 _shift_down = False
+_win_down = False
 _hide_taskbar = False
 
 
@@ -110,6 +111,11 @@ def _should_block(vk, is_keydown, alt_held, scan_code):
         # Ctrl+Shift+Esc открывает диспетчер задач и на отпускании.
         if _ctrl_down and vk == win32con.VK_ESCAPE:
             return True
+        # Win+I открывает Параметры. Сама клавиша Win в сессии остаётся.
+        if vk == 0x49 and _win_down:
+            return True
+        if vk == win32con.VK_DELETE and _shell_surface_focused():
+            return True
         if not is_keydown:
             return False
         return False
@@ -118,7 +124,7 @@ def _should_block(vk, is_keydown, alt_held, scan_code):
 
 
 def _update_modifiers(vk, is_keydown):
-    global _alt_down, _ctrl_down, _shift_down
+    global _alt_down, _ctrl_down, _shift_down, _win_down
 
     if vk in (win32con.VK_LMENU, win32con.VK_RMENU, win32con.VK_MENU):
         _alt_down = is_keydown
@@ -126,6 +132,26 @@ def _update_modifiers(vk, is_keydown):
         _ctrl_down = is_keydown
     elif vk in (win32con.VK_LSHIFT, win32con.VK_RSHIFT, win32con.VK_SHIFT):
         _shift_down = is_keydown
+    elif vk in (win32con.VK_LWIN, win32con.VK_RWIN):
+        _win_down = is_keydown
+
+
+def _shell_surface_focused():
+    """Рабочий стол и проводник. В игре Delete не трогаем."""
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return False
+        class_name = win32gui.GetClassName(hwnd)
+    except Exception:
+        return False
+    return class_name in (
+        "Progman",
+        "WorkerW",
+        "CabinetWClass",
+        "ExploreWClass",
+        "Shell_TrayWnd",
+    )
 
 
 # LRESULT на 64-bit — указатель. c_long здесь 32 бита, из-за этого Windows
@@ -314,7 +340,8 @@ def _apply_taskbar_visibility():
 
 def set_mode(mode, hide_taskbar=False):
     """strict — ожидание; session — игровая сессия; off — админ."""
-    global _keyboard_mode, _hide_taskbar, _listener_thread, _alt_down, _ctrl_down, _shift_down
+    global _keyboard_mode, _hide_taskbar, _listener_thread
+    global _alt_down, _ctrl_down, _shift_down, _win_down
 
     if mode not in (MODE_OFF, MODE_STRICT, MODE_SESSION):
         mode = MODE_OFF
@@ -328,6 +355,7 @@ def set_mode(mode, hide_taskbar=False):
             _alt_down = False
             _ctrl_down = False
             _shift_down = False
+            _win_down = False
 
         if mode == MODE_OFF:
             stop_block_unlocked()
