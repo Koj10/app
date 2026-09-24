@@ -119,6 +119,7 @@ _INSTALLERS = frozenset(
 _SETTINGS_PROCESSES = frozenset(
     {
         "systemsettings.exe",
+        "systemsettingsbroker.exe",
         "control.exe",
     }
 )
@@ -381,36 +382,108 @@ def _set_recycle_bin_hidden(hidden):
             _delete_value(winreg.HKEY_CURRENT_USER, path, _RECYCLE_BIN_CLSID)
 
 
+def _desktop_dirs():
+    home = os.path.expanduser("~")
+    public = os.environ.get("PUBLIC") or r"C:\Users\Public"
+    candidates = [
+        os.path.join(home, "Desktop"),
+        os.path.join(public, "Desktop"),
+    ]
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ) as key:
+            desktop, _ = winreg.QueryValueEx(key, "Desktop")
+            if desktop:
+                candidates.append(desktop)
+    except OSError:
+        pass
+    found = []
+    for path in candidates:
+        if path and os.path.isdir(path) and path not in found:
+            found.append(path)
+    return found
+
+
+def _icacls(args):
+    try:
+        subprocess.run(
+            ["icacls", *args],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=20,
+        )
+    except Exception as e:
+        logger.debug("icacls: %s", e)
+
+
+def _lock_desktop_delete(lock):
+    """Запрет удаления файлов на рабочем столе. Меню Windows 11 политику обходит, права — нет."""
+    user = os.environ.get("USERNAME")
+    if not user:
+        logger.warning("Не удалось закрыть удаление ярлыков: нет имени пользователя")
+        return
+    for folder in _desktop_dirs():
+        if lock:
+            _icacls([folder, "/deny", f"{user}:(OI)(CI)(DE,DC)", "/C", "/Q"])
+            _icacls([os.path.join(folder, "*"), "/deny", f"{user}:(DE,DC)", "/C", "/Q"])
+        else:
+            _icacls([folder, "/remove:d", user, "/T", "/C", "/Q"])
+    logger.info(
+        "PolicyGuard: удаление с рабочего стола %s",
+        "запрещено" if lock else "разрешено",
+    )
+
+
 def _apply_session_user_lock(enabled):
-    """В сессии нельзя удалять с рабочего стола и открывать Параметры."""
+    """В сессии нельзя удалять ярлыки с рабочего стола и открывать Параметры."""
     if enabled:
         _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoControlPanel", 1)
         _set_dword(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewContextMenu", 1)
         if not _set_sz(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "SettingsPageVisibility", "hide:*"):
             logger.warning("Не удалось закрыть параметры через реестр")
         _set_recycle_bin_hidden(True)
+        _lock_desktop_delete(True)
     else:
         _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoControlPanel")
         _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "NoViewContextMenu")
         _delete_value(winreg.HKEY_CURRENT_USER, _EXPLORER_POLICY, "SettingsPageVisibility")
         _set_recycle_bin_hidden(False)
+        _lock_desktop_delete(False)
     _refresh_desktop()
 
 
-def _close_settings():
+def _pids_named(names):
     _prepare_native()
-    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid = ctypes.c_void_p(-1).value
+    if not snapshot or snapshot == invalid:
+        return set()
+    found = set()
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return set()
+        while True:
+            if entry.szExeFile.lower() in names and entry.th32ProcessID:
+                found.add(entry.th32ProcessID)
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return found
 
-    def _terminate(pid):
-        if not pid:
-            return
-        handle = ctypes.windll.kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
-        if not handle:
-            return
-        try:
-            ctypes.windll.kernel32.TerminateProcess(handle, 1)
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+
+def _close_settings():
+    """Параметры на Windows 11 открываются отдельным процессом, заголовок окна часто пустой."""
+    _prepare_native()
+    for pid in _pids_named(_SETTINGS_PROCESSES):
+        _terminate_pid(pid)
+
+    user32 = ctypes.windll.user32
 
     def _enum(hwnd, _):
         try:
@@ -421,7 +494,7 @@ def _close_settings():
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
-        _terminate(pid.value)
+        _terminate_pid(pid.value)
         return True
 
     try:

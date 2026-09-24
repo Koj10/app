@@ -112,7 +112,7 @@ def _should_block(vk, is_keydown, alt_held, scan_code):
         if _ctrl_down and vk == win32con.VK_ESCAPE:
             return True
         # Win+I открывает Параметры. Сама клавиша Win в сессии остаётся.
-        if vk == 0x49 and _win_down:
+        if vk == 0x49 and (_win_down or _win_async_down()):
             return True
         if vk == win32con.VK_DELETE and _shell_surface_focused():
             return True
@@ -134,6 +134,16 @@ def _update_modifiers(vk, is_keydown):
         _shift_down = is_keydown
     elif vk in (win32con.VK_LWIN, win32con.VK_RWIN):
         _win_down = is_keydown
+
+
+def _win_async_down():
+    try:
+        user32 = ctypes.windll.user32
+        return bool(user32.GetAsyncKeyState(win32con.VK_LWIN) & 0x8000) or bool(
+            user32.GetAsyncKeyState(win32con.VK_RWIN) & 0x8000
+        )
+    except Exception:
+        return False
 
 
 def _shell_surface_focused():
