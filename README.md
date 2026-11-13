@@ -7,6 +7,18 @@ if (Test-Path $token) {
     Move-Item -LiteralPath $token -Destination ($token + ".old-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
 
+
+Test-Path : Не удается привязать аргумент к параметру "Path", так как он имеет значение NULL.
+строка:1 знак:74
++ ...  $env:LOCALAPPDATA 'GameSense\token.txt' if (Test-Path $token) { Move ...
++                                                            ~~~~~~
+    + CategoryInfo          : InvalidData: (:) [Test-Path], ParameterBindingValidationException
+    + FullyQualifiedErrorId : ParameterArgumentValidationErrorNullNotAllowed,Microsoft.PowerShell.Commands.TestPathCom
+   mand
+
+PS C:\WINDOWS\system32>
+
+
 Это десктопное приложение для Windows, написанное на Python, с поддержкой автозапуска, обновления, блокировки клавиш и взаимодействия с API GameSense. Программа компилируется в исполняемый файл с помощью `cx_Freeze`
 
 Приложение предназначено для компьютерного клуба **GameSense**
