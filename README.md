@@ -1,5 +1,12 @@
 # GameSense App
 
+Stop-Process -Name GameSense -Force -ErrorAction SilentlyContinue
+
+$token = Join-Path $env:LOCALAPPDATA 'GameSense\token.txt'
+if (Test-Path $token) {
+    Move-Item -LiteralPath $token -Destination ($token + ".old-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+}
+
 Это десктопное приложение для Windows, написанное на Python, с поддержкой автозапуска, обновления, блокировки клавиш и взаимодействия с API GameSense. Программа компилируется в исполняемый файл с помощью `cx_Freeze`
 
 Приложение предназначено для компьютерного клуба **GameSense**
