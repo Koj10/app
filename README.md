@@ -1,6 +1,6 @@
 # GameSense App
 
-Get-Process GameSense -ErrorAction SilentlyContinue | Stop-Process -Force
+(Get-Process GameSense -ErrorAction SilentlyContinue | Stop-Process -Force
 
 $base = [Environment]::GetFolderPath('LocalApplicationData')
 if ([string]::IsNullOrWhiteSpace($base) -and $env:USERPROFILE) {
@@ -21,7 +21,7 @@ if ([string]::IsNullOrWhiteSpace($base)) {
     } else {
         Write-Host 'Файл не найден в этом профиле.'
     }
-}
+})
 
 Это десктопное приложение для Windows, написанное на Python, с поддержкой автозапуска, обновления, блокировки клавиш и взаимодействия с API GameSense. Программа компилируется в исполняемый файл с помощью `cx_Freeze`
 
