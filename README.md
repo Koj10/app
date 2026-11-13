@@ -1,23 +1,27 @@
 # GameSense App
 
-Stop-Process -Name GameSense -Force -ErrorAction SilentlyContinue
+Get-Process GameSense -ErrorAction SilentlyContinue | Stop-Process -Force
 
-$token = Join-Path $env:LOCALAPPDATA 'GameSense\token.txt'
-if (Test-Path $token) {
-    Move-Item -LiteralPath $token -Destination ($token + ".old-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$base = [Environment]::GetFolderPath('LocalApplicationData')
+if ([string]::IsNullOrWhiteSpace($base) -and $env:USERPROFILE) {
+    $base = Join-Path $env:USERPROFILE 'AppData\Local'
 }
 
+if ([string]::IsNullOrWhiteSpace($base)) {
+    Write-Host 'Не найден профиль пользователя Windows.'
+    whoami
+    Write-Host "USERPROFILE=$env:USERPROFILE"
+} else {
+    $token = Join-Path $base 'GameSense\token.txt'
+    Write-Host "Ищу токен: $token"
 
-Test-Path : Не удается привязать аргумент к параметру "Path", так как он имеет значение NULL.
-строка:1 знак:74
-+ ...  $env:LOCALAPPDATA 'GameSense\token.txt' if (Test-Path $token) { Move ...
-+                                                            ~~~~~~
-    + CategoryInfo          : InvalidData: (:) [Test-Path], ParameterBindingValidationException
-    + FullyQualifiedErrorId : ParameterArgumentValidationErrorNullNotAllowed,Microsoft.PowerShell.Commands.TestPathCom
-   mand
-
-PS C:\WINDOWS\system32>
-
+    if (Test-Path -LiteralPath $token) {
+        Rename-Item -LiteralPath $token -NewName ("token.txt.old-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Write-Host 'Старый токен переименован. Теперь запусти GameSense.'
+    } else {
+        Write-Host 'Файл не найден в этом профиле.'
+    }
+}
 
 Это десктопное приложение для Windows, написанное на Python, с поддержкой автозапуска, обновления, блокировки клавиш и взаимодействия с API GameSense. Программа компилируется в исполняемый файл с помощью `cx_Freeze`
 
