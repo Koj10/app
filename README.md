@@ -1,27 +1,27 @@
 # GameSense App
 
-(Get-Process GameSense -ErrorAction SilentlyContinue | Stop-Process -Force
-
-$base = [Environment]::GetFolderPath('LocalApplicationData')
-if ([string]::IsNullOrWhiteSpace($base) -and $env:USERPROFILE) {
-    $base = Join-Path $env:USERPROFILE 'AppData\Local'
-}
-
-if ([string]::IsNullOrWhiteSpace($base)) {
-    Write-Host 'Не найден профиль пользователя Windows.'
-    whoami
-    Write-Host "USERPROFILE=$env:USERPROFILE"
-} else {
-    $token = Join-Path $base 'GameSense\token.txt'
-    Write-Host "Ищу токен: $token"
-
-    if (Test-Path -LiteralPath $token) {
-        Rename-Item -LiteralPath $token -NewName ("token.txt.old-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        Write-Host 'Старый токен переименован. Теперь запусти GameSense.'
-    } else {
-        Write-Host 'Файл не найден в этом профиле.'
+    Get-Process GameSense -ErrorAction SilentlyContinue | Stop-Process -Force
+    
+    $base = [Environment]::GetFolderPath('LocalApplicationData')
+    if ([string]::IsNullOrWhiteSpace($base) -and $env:USERPROFILE) {
+        $base = Join-Path $env:USERPROFILE 'AppData\Local'
     }
-})
+    
+    if ([string]::IsNullOrWhiteSpace($base)) {
+        Write-Host 'Не найден профиль пользователя Windows.'
+        whoami
+        Write-Host "USERPROFILE=$env:USERPROFILE"
+    } else {
+        $token = Join-Path $base 'GameSense\token.txt'
+        Write-Host "Ищу токен: $token"
+    
+        if (Test-Path -LiteralPath $token) {
+            Rename-Item -LiteralPath $token -NewName ("token.txt.old-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Write-Host 'Старый токен переименован. Теперь запусти GameSense.'
+        } else {
+            Write-Host 'Файл не найден в этом профиле.'
+        }
+    }
 
 Это десктопное приложение для Windows, написанное на Python, с поддержкой автозапуска, обновления, блокировки клавиш и взаимодействия с API GameSense. Программа компилируется в исполняемый файл с помощью `cx_Freeze`
 
